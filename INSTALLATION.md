@@ -20,7 +20,7 @@ Complete setup instructions for AutoMem across all environments.
 
 ## Prerequisites
 
-- **Python 3.10+**
+- **Python 3.10+** (the codebase supports 3.10 and newer; local bootstrap is standardized on 3.12)
 - **Docker & Docker Compose** (for bundled stack)
 - **Railway CLI** (for Railway deployment): `npm i -g @railway/cli`
 
@@ -35,16 +35,15 @@ Complete setup instructions for AutoMem across all environments.
 git clone https://github.com/verygoodplugins/automem.git
 cd automem
 
-# Create virtual environment
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements-dev.txt
+# Create virtual environment (standardized on Python 3.12 for local dev)
+make install
+source .venv/bin/activate  # On Windows (WSL or Git Bash): same command; native cmd: .venv\Scripts\activate.bat; PowerShell: .venv\Scripts\Activate.ps1
 
 # Start all services (FalkorDB + Qdrant + API)
 make dev
 ```
+
+`make install` looks for `python3.12` first (and a few common install locations), then falls back to `python3` if it is already 3.12. It exits with an error only when no Python 3.12 interpreter can be found. Override the interpreter with the `AUTOMEM_PYTHON` environment variable (accepts a bare command name or an absolute path).
 
 **Services:**
 
@@ -324,7 +323,7 @@ Run API without Docker (requires external FalkorDB):
 
 ```bash
 # Activate virtual environment
-source venv/bin/activate
+source .venv/bin/activate
 
 # Set connection details
 export FALKORDB_HOST=localhost
