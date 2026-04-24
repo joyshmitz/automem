@@ -44,8 +44,26 @@ load_dotenv()
 load_dotenv(Path.home() / ".config" / "automem" / ".env")
 
 from tests.benchmarks.backends import MemoryRecord, SearchRequest, create_backend
+from tests.benchmarks.judge_policy import (
+    CANONICAL_BENCHMARK_JUDGE_MODEL,
+    DEFAULT_JUDGE_PROVIDER,
+    is_gpt5_family,
+    judge_metadata,
+)
 
-DEFAULT_CAT5_JUDGE_MODEL = "gpt-5.1"
+DEFAULT_CAT5_JUDGE_MODEL = CANONICAL_BENCHMARK_JUDGE_MODEL
+JUDGE_API_SURFACE = "chat.completions"
+LOCOMO_CAT5_JUDGE_PROMPT_VERSION = "locomo-cat5-v1"
+LOCOMO_CAT5_JUDGE_SCHEMA_VERSION = "locomo-cat5-json-v1"
+JUDGE_PRICING_USD_PER_1M = {
+    "gpt-5.4": {"input": 2.50, "output": 15.00},
+    "gpt-5.4-mini": {"input": 0.75, "output": 4.50},
+    "gpt-5.4-nano": {"input": 0.20, "output": 1.25},
+    "gpt-5.4-pro": {"input": 30.00, "output": 180.00},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4.1": {"input": 2.0, "output": 8.0},
+    "gpt-5.1": {"input": 1.25, "output": 10.0},
+}
 
 
 @dataclass
@@ -95,6 +113,15 @@ def _default_scope_prefix(backend: str, data_file: str) -> str:
     return f"locomo-{backend}-{digest}"
 
 
+def _pricing_model_key(model_name: Optional[str]) -> Optional[str]:
+    if not model_name:
+        return None
+    normalized = model_name.strip()
+    if re.match(r".+-\d{4}-\d{2}-\d{2}$", normalized):
+        return re.sub(r"-\d{4}-\d{2}-\d{2}$", "", normalized)
+    return normalized
+
+
 class LoCoMoEvaluator:
     """Evaluates AutoMem against the LoCoMo benchmark"""
 
@@ -130,6 +157,19 @@ class LoCoMoEvaluator:
         # Embedding-based answer checking (fast, handles semantic similarity)
         self.use_embedding_similarity = self.has_openai_api_key
         self.embedding_cache = {}  # text -> embedding vector
+        self.judge_stats = {
+            "questions_requiring_judge": 0,
+            "api_calls": 0,
+            "cache_hits": 0,
+            "errors": 0,
+            "skipped": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        self._judge_api_latencies_ms: List[float] = []
+        self._judge_estimated_cost_usd = 0.0
+        self._judge_cost_estimate_available = True
 
     def health_check(self) -> bool:
         """Verify the configured backend is accessible."""
@@ -1104,101 +1144,98 @@ Respond in JSON format:
     @staticmethod
     def _judge_model_uses_structured_outputs(model_name: Optional[str]) -> bool:
         """GPT-5 family models prefer strict json_schema over legacy json_object mode."""
-        return bool(model_name and model_name.strip().lower().startswith("gpt-5"))
+        return is_gpt5_family(model_name)
 
-    def _judge_response_format(self) -> Dict[str, Any]:
-        if self._judge_model_uses_structured_outputs(self.config.judge_model):
-            return {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "locomo_cat5_judge",
-                    "strict": True,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "generated_answer": {"type": "string"},
-                            "verdict": {
-                                "type": "string",
-                                "enum": [
-                                    "supported",
-                                    "abstain",
-                                    "contradiction",
-                                    "unsupported",
-                                    "incorrect",
-                                ],
-                            },
-                            "correct": {"type": "boolean"},
-                            "confidence": {"type": "number"},
-                            "reasoning": {"type": "string"},
-                        },
-                        "required": [
-                            "generated_answer",
-                            "verdict",
-                            "correct",
-                            "confidence",
-                            "reasoning",
-                        ],
-                        "additionalProperties": False,
-                    },
-                },
-            }
-        return {"type": "json_object"}
+    def _judge_metadata(self) -> Dict[str, Any]:
+        return judge_metadata(self.config.judge_model, provider=DEFAULT_JUDGE_PROVIDER)
 
-    def _judge_token_attempts(self) -> Tuple[int, ...]:
-        if self._judge_model_uses_structured_outputs(self.config.judge_model):
-            return self.GPT5_JUDGE_MAX_COMPLETION_TOKENS
-        return (250,)
+    @staticmethod
+    def _hash_payload(payload: Any) -> str:
+        if isinstance(payload, (dict, list, tuple)):
+            text = json.dumps(payload, sort_keys=True)
+        else:
+            text = str(payload)
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-    def judge_complex_reasoning(
-        self,
-        question: str,
-        adversarial_answer: str,
-        recalled_memories: List[Dict[str, Any]],
-        evidence_dialog_ids: List[str],
-        sample_id: str,
-    ) -> Tuple[Optional[bool], float, str, Optional[str], Optional[str]]:
-        """Judge a category-5 question using recalled memories and evidence dialogs."""
+    @staticmethod
+    def _usage_value(usage: Any, field: str) -> int:
+        if usage is None:
+            return 0
+        value = usage.get(field, 0) if isinstance(usage, dict) else getattr(usage, field, 0)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _percentile(values: List[float], percentile: float) -> Optional[float]:
+        if not values:
+            return None
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return ordered[0]
+        rank = (len(ordered) - 1) * percentile
+        lower = int(rank)
+        upper = min(lower + 1, len(ordered) - 1)
+        weight = rank - lower
+        return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+    def _judge_pricing(self) -> Optional[Dict[str, float]]:
+        input_override = os.getenv("BENCH_JUDGE_INPUT_COST_PER_1M")
+        output_override = os.getenv("BENCH_JUDGE_OUTPUT_COST_PER_1M")
+        if input_override and output_override:
+            try:
+                return {
+                    "input": float(input_override),
+                    "output": float(output_override),
+                }
+            except ValueError:
+                return None
         if not self.config.judge_model:
-            return None, 0.0, "Skipped: requires LLM judge", None, None
+            return None
+        return JUDGE_PRICING_USD_PER_1M.get(_pricing_model_key(self.config.judge_model))
 
-        if not self.openai_client:
-            return None, 0.0, "Skipped: OPENAI_API_KEY not set for LLM judge", None, None
+    def _estimate_judge_cost(self, prompt_tokens: int, completion_tokens: int) -> Optional[float]:
+        pricing = self._judge_pricing()
+        if not pricing:
+            return None
+        return (prompt_tokens / 1_000_000) * pricing["input"] + (
+            completion_tokens / 1_000_000
+        ) * pricing["output"]
 
-        evidence_memories = self.fetch_evidence_memories(
-            evidence_dialog_ids,
-            sample_id,
-            use_local_cache=True,
+    def _record_judge_usage(self, usage: Any) -> None:
+        prompt_tokens = self._usage_value(usage, "prompt_tokens")
+        completion_tokens = self._usage_value(usage, "completion_tokens")
+        total_tokens = self._usage_value(usage, "total_tokens")
+        if total_tokens == 0 and (prompt_tokens or completion_tokens):
+            total_tokens = prompt_tokens + completion_tokens
+
+        self.judge_stats["prompt_tokens"] += prompt_tokens
+        self.judge_stats["completion_tokens"] += completion_tokens
+        self.judge_stats["total_tokens"] += total_tokens
+
+        estimated_cost = self._estimate_judge_cost(prompt_tokens, completion_tokens)
+        if estimated_cost is None:
+            if prompt_tokens or completion_tokens:
+                self._judge_cost_estimate_available = False
+            return
+        self._judge_estimated_cost_usd += estimated_cost
+
+    def _judge_system_prompt(self) -> str:
+        return (
+            "You are a strict benchmark judge. "
+            "Use recalled memories to draft the answer and evidence dialogs "
+            "only to verify correctness."
         )
-        if len(evidence_memories) < len(set(evidence_dialog_ids)):
-            return (
-                None,
-                0.0,
-                "Skipped: no evidence memories available for LLM judge",
-                None,
-                None,
-            )
 
-        recalled_text = self._format_memories_for_llm(recalled_memories, limit=25)
-        evidence_text = self._format_memories_for_llm(evidence_memories, limit=8)
-        cache_key = self._make_llm_cache_key(
-            "judge_cat5",
-            self.config.judge_model,
-            question,
-            adversarial_answer,
-            evidence_dialog_ids,
-            recalled_text,
-            evidence_text,
-        )
-        if cache_key in self.llm_cache:
-            return self.llm_cache[cache_key]
-
-        prompt = f"""You are judging a LoCoMo category-5 complex reasoning answer.
+    def _judge_prompt_template(self) -> str:
+        return """You are judging a LoCoMo category-5 complex reasoning answer.
 
 Question:
 {question}
 
 Adversarial answer (distractor; may be wrong, incomplete, or occasionally overlap with the evidence):
-{adversarial_answer or "None"}
+{adversarial_answer}
 
 Recalled memories:
 {recalled_text}
@@ -1226,19 +1263,188 @@ Respond with ONLY a JSON object:
   "reasoning": "brief explanation grounded in the evidence dialogs"
 }}"""
 
+    def _judge_response_schema(self) -> Dict[str, Any]:
+        return {
+            "name": "locomo_cat5_judge",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "generated_answer": {"type": "string"},
+                    "verdict": {
+                        "type": "string",
+                        "enum": [
+                            "supported",
+                            "abstain",
+                            "contradiction",
+                            "unsupported",
+                            "incorrect",
+                        ],
+                    },
+                    "correct": {"type": "boolean"},
+                    "confidence": {"type": "number"},
+                    "reasoning": {"type": "string"},
+                },
+                "required": [
+                    "generated_answer",
+                    "verdict",
+                    "correct",
+                    "confidence",
+                    "reasoning",
+                ],
+                "additionalProperties": False,
+            },
+        }
+
+    def _judge_config(self) -> Dict[str, Any]:
+        metadata = self._judge_metadata()
+        return {
+            "enabled": bool(self.config.judge_model),
+            "provider": metadata["judge_provider"],
+            "api": JUDGE_API_SURFACE if self.config.judge_model else None,
+            "model": metadata["judge_model"],
+            "profile": metadata["judge_profile"],
+            "snapshot_pinned": metadata["judge_snapshot_pinned"],
+            "prompt_version": (
+                LOCOMO_CAT5_JUDGE_PROMPT_VERSION if self.config.judge_model else None
+            ),
+            "prompt_sha256": (
+                self._hash_payload(
+                    {
+                        "system": self._judge_system_prompt(),
+                        "user_template": self._judge_prompt_template(),
+                    }
+                )
+                if self.config.judge_model
+                else None
+            ),
+            "response_schema_version": (
+                LOCOMO_CAT5_JUDGE_SCHEMA_VERSION if self.config.judge_model else None
+            ),
+            "response_schema_sha256": (
+                self._hash_payload(self._judge_response_schema())
+                if self.config.judge_model
+                else None
+            ),
+            "reasoning_effort": None,
+            "seed": None,
+            "temperature": (
+                (
+                    None
+                    if self._judge_model_uses_structured_outputs(self.config.judge_model)
+                    else 0.0
+                )
+                if self.config.judge_model
+                else None
+            ),
+            "max_completion_tokens_attempts": (
+                list(self._judge_token_attempts()) if self.config.judge_model else []
+            ),
+            "timeout_seconds": (
+                self.OPENAI_REQUEST_TIMEOUT_SECONDS if self.config.judge_model else None
+            ),
+        }
+
+    def _judge_stats_summary(self) -> Dict[str, Any]:
+        latencies = self._judge_api_latencies_ms
+        return {
+            **self.judge_stats,
+            "estimated_cost_usd": (
+                round(self._judge_estimated_cost_usd, 6)
+                if self._judge_cost_estimate_available and latencies
+                else None
+            ),
+            "latency_ms": {
+                "avg": round(sum(latencies) / len(latencies), 3) if latencies else None,
+                "p50": round(self._percentile(latencies, 0.50), 3) if latencies else None,
+                "p95": round(self._percentile(latencies, 0.95), 3) if latencies else None,
+                "max": round(max(latencies), 3) if latencies else None,
+            },
+        }
+
+    def _judge_response_format(self) -> Dict[str, Any]:
+        if self._judge_model_uses_structured_outputs(self.config.judge_model):
+            return {
+                "type": "json_schema",
+                "json_schema": self._judge_response_schema(),
+            }
+        return {"type": "json_object"}
+
+    def _judge_token_attempts(self) -> Tuple[int, ...]:
+        if self._judge_model_uses_structured_outputs(self.config.judge_model):
+            return self.GPT5_JUDGE_MAX_COMPLETION_TOKENS
+        return (250,)
+
+    def judge_complex_reasoning(
+        self,
+        question: str,
+        adversarial_answer: str,
+        recalled_memories: List[Dict[str, Any]],
+        evidence_dialog_ids: List[str],
+        sample_id: str,
+    ) -> Tuple[Optional[bool], float, str, Optional[str], Optional[str]]:
+        """Judge a category-5 question using recalled memories and evidence dialogs."""
+        if not self.config.judge_model:
+            return None, 0.0, "Skipped: requires LLM judge", None, None
+
+        if not self.openai_client:
+            return (
+                None,
+                0.0,
+                "Skipped: OPENAI_API_KEY not set for LLM judge",
+                None,
+                None,
+            )
+
+        evidence_memories = self.fetch_evidence_memories(
+            evidence_dialog_ids,
+            sample_id,
+            use_local_cache=True,
+        )
+        if len(evidence_memories) < len(set(evidence_dialog_ids)):
+            return (
+                None,
+                0.0,
+                "Skipped: no evidence memories available for LLM judge",
+                None,
+                None,
+            )
+
+        recalled_text = self._format_memories_for_llm(recalled_memories, limit=25)
+        evidence_text = self._format_memories_for_llm(evidence_memories, limit=8)
+        cache_key = self._make_llm_cache_key(
+            "judge_cat5",
+            LOCOMO_CAT5_JUDGE_PROMPT_VERSION,
+            LOCOMO_CAT5_JUDGE_SCHEMA_VERSION,
+            self.config.judge_model,
+            question,
+            adversarial_answer,
+            evidence_dialog_ids,
+            recalled_text,
+            evidence_text,
+        )
+        if cache_key in self.llm_cache:
+            self.judge_stats["cache_hits"] += 1
+            return self.llm_cache[cache_key]
+
+        prompt = self._judge_prompt_template().format(
+            question=question,
+            adversarial_answer=adversarial_answer or "None",
+            recalled_text=recalled_text,
+            evidence_text=evidence_text,
+        )
+
         last_error: Optional[Exception] = None
         for token_budget in self._judge_token_attempts():
+            request_started = time.perf_counter()
+            self.judge_stats["api_calls"] += 1
             try:
                 request_kwargs: Dict[str, Any] = {
                     "model": self.config.judge_model,
                     "messages": [
                         {
                             "role": "system",
-                            "content": (
-                                "You are a strict benchmark judge. "
-                                "Use recalled memories to draft the answer and evidence dialogs "
-                                "only to verify correctness."
-                            ),
+                            "content": self._judge_system_prompt(),
                         },
                         {"role": "user", "content": prompt},
                     ],
@@ -1252,6 +1458,8 @@ Respond with ONLY a JSON object:
                     request_kwargs["temperature"] = 0.0
 
                 response = self.openai_client.chat.completions.create(**request_kwargs)
+                self._judge_api_latencies_ms.append((time.perf_counter() - request_started) * 1000)
+                self._record_judge_usage(getattr(response, "usage", None))
                 result = self._parse_json_object_response(response.choices[0].message.content)
                 correct = result.get("correct")
                 if not isinstance(correct, bool):
@@ -1271,8 +1479,13 @@ Respond with ONLY a JSON object:
                 self.llm_cache[cache_key] = judge_result
                 return judge_result
             except Exception as e:
+                if len(self._judge_api_latencies_ms) < self.judge_stats["api_calls"]:
+                    self._judge_api_latencies_ms.append(
+                        (time.perf_counter() - request_started) * 1000
+                    )
                 last_error = e
 
+        self.judge_stats["errors"] += 1
         error_result = (
             None,
             0.0,
@@ -1571,6 +1784,7 @@ Respond with ONLY a JSON object:
         base_result["recalled_count"] = len(recalled_memories)
 
         if category == 5 and not answer:
+            self.judge_stats["questions_requiring_judge"] += 1
             (
                 is_correct,
                 confidence,
@@ -1593,6 +1807,8 @@ Respond with ONLY a JSON object:
                     "judge_reasoning": judge_reasoning,
                 }
             )
+            if is_correct is None:
+                self.judge_stats["skipped"] += 1
             return base_result
 
         is_correct, confidence, explanation = self.check_answer_in_memories(
@@ -1842,6 +2058,39 @@ Respond with ONLY a JSON object:
         print(f"\n🎯 Overall Accuracy: {overall_accuracy:.2%} ({total_correct}/{total_questions})")
         print(f"⏱️  Total Time: {elapsed_time:.1f}s")
         print(f"💾 Total Memories Stored: {sum(r['memory_count'] for r in conversation_results)}")
+        if self.config.judge_model:
+            judge_config = self._judge_config()
+            judge_stats = self._judge_stats_summary()
+            print("\n🧑‍⚖️ Judge Summary:")
+            print(f"  Model: {judge_config['model']}")
+            print(f"  Profile: {judge_config['profile']}")
+            print(
+                "  Questions/API calls/cache hits/skipped: "
+                f"{judge_stats['questions_requiring_judge']}/"
+                f"{judge_stats['api_calls']}/"
+                f"{judge_stats['cache_hits']}/"
+                f"{judge_stats['skipped']}"
+            )
+            if judge_stats["api_calls"]:
+                print(
+                    "  Tokens (prompt/completion/total): "
+                    f"{judge_stats['prompt_tokens']}/"
+                    f"{judge_stats['completion_tokens']}/"
+                    f"{judge_stats['total_tokens']}"
+                )
+                latency = judge_stats["latency_ms"]
+                print(
+                    "  API latency ms (avg/p50/p95/max): "
+                    f"{latency['avg']:.1f}/"
+                    f"{latency['p50']:.1f}/"
+                    f"{latency['p95']:.1f}/"
+                    f"{latency['max']:.1f}"
+                )
+                cost = judge_stats["estimated_cost_usd"]
+                if cost is None:
+                    print("  Estimated API cost: n/a")
+                else:
+                    print(f"  Estimated API cost: ${cost:.4f}")
 
         # Category breakdown
         print("\n📈 Category Breakdown:")
@@ -1902,14 +2151,8 @@ Respond with ONLY a JSON object:
                     f"  {cat5_name:25s}: {accuracy:6.2%} ({correct:3d}/{total:3d}, {cat5_skipped:3d} skipped)"
                 )
 
-        # Comparison with the published CORE reference.
-        # Treat 88.24% as a useful external reference point, not a strict
-        # apples-to-apples leaderboard, because public LoCoMo setups differ.
         core_sota = 0.8824
         improvement = overall_accuracy - core_sota
-        print("\n📊 Comparison with published CORE reference:")
-        print(f"  CORE: {core_sota:.2%}")
-        print(f"  AutoMem: {overall_accuracy:.2%}")
         if cat5_skipped:
             if self.config.judge_model:
                 print(
@@ -1919,12 +2162,6 @@ Respond with ONLY a JSON object:
                 print(
                     f"  ⚠️  AutoMem excludes {cat5_skipped} cat-5 Qs (needs LLM judge); treat comparison as directional only"
                 )
-        if improvement > 0:
-            print(f"  📈 AutoMem is {improvement:.2%} above that reference")
-        elif improvement < 0:
-            print(f"  📉 AutoMem is {abs(improvement):.2%} behind that reference")
-        else:
-            print("  🤝 AutoMem matches that reference")
 
         # Cleanup
         if cleanup_after:
@@ -1942,7 +2179,9 @@ Respond with ONLY a JSON object:
             "backend": self.backend.name,
             "judge_requested": bool(self.config.judge_model),
             "judge_available": bool(self.config.judge_model and self.openai_client),
-            "judge_model": self.config.judge_model,
+            **self._judge_metadata(),
+            "judge_config": self._judge_config(),
+            "judge_stats": self._judge_stats_summary(),
             "categories": category_results,
             "conversations": conversation_results,
             "comparison": {
